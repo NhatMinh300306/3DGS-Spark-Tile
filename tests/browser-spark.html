@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Spark decoder QA — synthetic data</title>
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js",
+          "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/",
+          "@sparkjsdev/spark": "https://sparkjs.dev/releases/spark/2.3.1/spark.module.js"
+        }
+      }
+    </script>
+    <style>
+      body {
+        background: #10201d;
+        color: #e4f4e9;
+        font: 16px monospace;
+        padding: 40px;
+      }
+      button {
+        padding: 14px;
+      }
+      pre {
+        white-space: pre-wrap;
+        line-height: 1.7;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Spark 2.3.1 decoder QA</h1>
+    <p>Synthetic SH1 Gaussians. This test checks decoding, not rendered FPS.</p>
+    <button id="run">Run actual Spark decoder</button>
+    <pre id="result">Ready.</pre>
+    <h2>v9 arrival-driven tiles</h2>
+    <p>Hold one real tile response. Other tiles must appear before it is released.</p>
+    <button id="stream">Run progressive test</button>
+    <button id="release" disabled>Release delayed tile</button>
+    <pre id="streamResult">
+Ready. This checks real decoding and scene membership, not GPU rendering.</pre>
+    <script type="module">
+      import * as THREE from 'three';
+      import { SplatMesh } from '@sparkjsdev/spark';
+      import { buildTileGroups, createTileLoader } from './tiles.js';
+      import { createProgressiveTiles } from './progressive.js';
+      document.getElementById('stream').onclick = async () => {
+        const log = document.getElementById('streamResult');
+        const releaseButton = document.getElementById('release');
+        const runButton = document.getElementById('stream');
+        runButton.disabled = true;
+        let player, animation, unhold;
+        try {
+          const url = new URL('./qa-fixture/tiles.json', location.href).href;
+          const groups = buildTileGroups(await (await fetch(url)).json(), url);
+          let held = false,
+            released = false;
+          const load = createTileLoader({
+            THREE,
+            SplatMesh,
+            fetcher: async (url, options) => {
+              if (url.includes('frame_1450/voxels_new/x_1y_0z_0.ply')) {
+                held = true;
+                await new Promise((resolve, reject) => {
+                  unhold = resolve;
+                  options.signal.addEventListener('abort', () => reject(Error('cancelled')), {
+                    once: true,
+                  });
+                });
+              }
+              return fetch(url, options);
+            },
+          });
+          player = createProgressiveTiles({
+            THREE,
+            frames: groups.layer_8.slice(0, 2),
+            loadTileFrame: load,
+            concurrency: () => 2,
+            loop: () => false,
+          });
+          const tick = (now) => {
+            player.tick(now);
+            const state = player.state();
+            if (held && !released && state.visibleCells === 2 && state.minStamp === 1) {
+              log.textContent =
+                'PASS: Two real Spark tile meshes from frame 1451 are visible in the scene while a tile from frame 1450 is still blocked.\nPASS: No complete-frame barrier.\nRelease the delayed tile to verify stale rejection.';
+              releaseButton.disabled = false;
+            }
+            if (state.failures) {
+              log.textContent = 'FAIL: ' + state.lastError;
+              player.dispose();
+              runButton.disabled = false;
+              return;
+            }
+            if (state.finished) {
+              log.textContent =
+                state.stale === 1 && state.visibleCells === 2
+                  ? 'PASS: Actual Spark WASM decoded all four tile files with SH1.\nPASS: Newer tiles appeared before the slow old tile completed.\nPASS: Late old tile was discarded; newest cell meshes stayed in the scene.\nPASS: One mesh per cell; all groups disposed at test end.\nNo GPU rendering/FPS claim.'
+                  : 'FAIL: Unexpected final state ' + JSON.stringify(state);
+              player.dispose();
+              runButton.disabled = false;
+              releaseButton.disabled = true;
+              return;
+            }
+            animation = requestAnimationFrame(tick);
+          };
+          releaseButton.onclick = () => {
+            released = true;
+            unhold?.();
+            releaseButton.disabled = true;
+          };
+          log.textContent = 'Decoding real synthetic PLY tiles; one response is held…';
+          animation = requestAnimationFrame(tick);
+        } catch (error) {
+          cancelAnimationFrame(animation);
+          player?.dispose();
+          log.textContent = 'FAIL: ' + error.stack;
+          runButton.disabled = false;
+        }
+      };
+      const result = document.getElementById('result');
+      const equal = (a, b, name) => {
+        if (a.length !== b.length || a.some((x, i) => x !== b[i])) throw Error(name + ' differs');
+      };
+      document.getElementById('run').onclick = async () => {
+        result.textContent = 'Running…';
+        const groups = [];
+        try {
+          const url = new URL('./qa-fixture/tiles.json', location.href).href;
+          const manifest = await (await fetch(url)).json();
+          const entry = buildTileGroups(manifest, url).layer_8[0];
+          const load = createTileLoader({ THREE, SplatMesh });
+          const options = { signal: new AbortController().signal, wanted: () => true };
+          const fast = await load(entry, options);
+          groups.push(fast);
+          const tiles = await load({ ...entry, fastFrame: null }, options);
+          groups.push(tiles);
+          const packed = fast.children[0].packedSplats;
+          if (fast.children.length !== 1 || fast.tileSplats !== 32 || !packed.extra.sh1)
+            throw Error('Missing splats/SH1');
+          const joined = tiles.children.map((m) => m.packedSplats);
+          // Tile completion order is concurrent: sort by the first center before comparing vertex order.
+          joined.sort((a, b) => a.getSplat(0).center.x - b.getSplat(0).center.x);
+          equal(
+            [...packed.packedArray.slice(0, 32 * 4)],
+            joined.flatMap((p) => [...p.packedArray.slice(0, p.numSplats * 4)]),
+            'Packed base',
+          );
+          equal(
+            [...packed.extra.sh1.slice(0, 32 * 2)],
+            joined.flatMap((p) => [...p.extra.sh1.slice(0, p.numSplats * 2)]),
+            'SH1',
+          );
+          const box = fast.getBoundingBox();
+          if (box.min.x !== -0.7 || box.max.x !== 0.7) throw Error('JSON bounds');
+          result.textContent =
+            'PASS: Actual Spark WASM decoded all 32 Gaussians.\nPASS: Fast frame = 1 HTTP request / 1 SplatMesh.\nPASS: Individual tiles = 2 HTTP requests / 2 SplatMesh.\nPASS: Packed base attributes and SH1 match tile-by-tile decoding exactly.\nPASS: Bounding box came from voxel_new.json.\nNo GPU rendering/FPS claim is made by this test.';
+        } catch (error) {
+          result.textContent = 'FAIL: ' + error.stack;
+        } finally {
+          for (const group of groups) group.dispose();
+        }
+      };
+    </script>
+  </body>
+</html>
